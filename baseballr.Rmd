@@ -1,0 +1,483 @@
+---
+title: "A Noble Attempt at Using Sabermetrics for D3 College Baseball"
+author: "Ben Steves"
+date: "6/29/2021"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(tidyverse)
+require(mosaic)
+require(dplyr)
+require(rvest)
+require(magrittr)
+```
+
+## Premise
+
+There is nothing more niche than going about a data analysis using Division 3 baseball stats. This is a hill I am happy to die on. Division 3 baseball is not popular - not even in the slighest, at least on the global scale. Major league baseball scouts primarily look at D1 and D2 athletes when trying to evaluate talent. Not that D3 is bad - but the skill level is lesser than D1. MLB teams draft maybe 2 or 3 D3 players a year, sometimes more, sometimes none. Considering every team has 20 picks * 30 teams + 20 possible compensatory picks gives you about 620 total picks, give or take a few. Three out of 620 is 0.4%. Scouts don't really scout D3 baseball players unless you hit 20 homers or throw 96, which is D1 level play, usually.
+
+I aimed to try and bring sabermetrics used by Major League Baseball (MLB) teams to the college level, specifically to the teams in the MIAA. Sabermetrics are advanced statistics that give information on how a player is performing. These stats, however, are more detailed and technical than typical stats like batting average, and require heftier calculations. For this project, I calculate a statistic called OFF that uses sabermetrics to calculate the total offensive production of certain players in the MIAA, including Calvin's team. 
+
+## Functions
+
+I've documented the functions I made in the actual code. The first three are functions I made myself so that I could perform them on multiple datasets at once, and they are mainly for data cleaning. The rest are all sabermetrics. All formulas come from https://www.fangraphs.com/ which is the go-to website for sabermetrics data and info. 
+
+```{r FUNCTIONS}
+# remove NA values
+removeNA <-function(df) {
+    df <- df %>%
+      mutate(across(everything(), .fns = ~replace_na(.,0))) 
+}
+
+# choose any columns you want and make integer (for multiple columns at once)
+makeStatsIntegers <- function(df, startCol, endCol) {
+  df <- df %>%
+    mutate_at(c(startCol:endCol), ~ as.numeric(.)); df
+} 
+
+# cleans up variable names into format R can use
+cleanWithJanitor <- function(df) {
+  df <- df %>%
+    janitor::clean_names(); df
+}
+
+# Calculates Weighted On Base Average (wOBA), which is like Batting Average except it weight certain hits differently
+wOBA <- function(bb, hbp, x1b, x2b, x3b, hr, ab, sf) {
+    numerator = (0.69*bb) + (0.719*hbp) + (0.87*x1b) + (1.217*x2b) + (1.529*x3b) + (1.94*hr)
+    denominator = ab + hbp + bb + sf
+    numerator/denominator
+}
+
+# Batting Average on Balls in Play (BABIP) - batting average on all non-strikeouts and home runs
+BABIP <- function(h, hr, ab, k, sf) {
+  numerator = (h - hr)
+  denominator = (ab - k - hr + sf)
+  numerator/denominator
+}
+
+# wRAA - How many runs a player contributes to a team above average
+wRAA <- function(wOBA, lgWOBA, pa) {
+  ((wOBA - lgWOBA)/1.1) * pa
+}
+
+# Calculates if certain parks are more hitter friendly or pitcher friendly. 
+ParkFactor <- function(g_home, g_away, rf_home, rf_away, ra_home, ra_away) {
+  home = (rf_home + ra_home) / g_home
+  away = (rf_away + ra_away) / g_away
+  result = home / away
+  result
+}
+
+# Weighted Runs Created - very similar to wRAA
+wRC <- function(wOBA, lgwOBA, pa, lgR, lgPA) {
+  (((wOBA - lgwOBA)/1.1) + (lgR/lgPA)) * pa
+}
+
+# Part of OFF formula, which is batting_runs + base_running_runs
+BattingRuns <- function(wRAA, lgR, lgPA, pf, pa, lgwRC, lgPAh) {
+  wRAA + (lgR/lgPA - (pf*lgR/lgPA))*pa + (lgR/lgPA - (lgwRC/lgPAh))*pa
+}
+
+# Used in wSB, just the average runs in a year / average outs in a year
+RunsPerOut <- function(lgR, lgO) {
+  lgR / lgO
+}
+
+# Value used in wSB
+runCS <- function(rpo) {
+  -1 * (2 * rpo + 0.075)
+}
+
+# League average Weighted Stolen Base Runs (wSB), which contains 
+# league averages of stolen base attempts, times caught stealing, etc
+lgwSB <- function(lgSB, lgCS, runCS, lg1b, lgBB, lgHBP) {
+  ((lgSB * 0.2) + (lgCS * runCS)) / (lg1b + lgBB + lgHBP)
+}
+
+# Part of off formula. Other elements of base running runs were not available as data, 
+# so I instead calculated my own version of OFF which takes out those values. 
+wSB <- function(sb, cs, runCS, lgwSB, x1b, bb, hbp) {
+  (sb * 0.2) + (cs * runCS) - (lgwSB * (x1b + bb + hbp))
+}
+```
+
+## Cleaning, Transforming, Calculating
+
+### Offensive stats
+
+Scraping web data to get data for 8 MIAA teams 2021 statistics. Schools include Calvin University, Alma College, Albion College, Adrian College, Hope College, Trine University, Kalamazoo College, and Olivet College. 
+
+```{r}
+url1 <- 'https://calvinknights.com/sports/bsb/2020-21/teams/calvin?view=lineup&r=0&pos='
+content1 <- read_html(url1)
+calvinDF <- html_table(content1, header = TRUE)[[4]] %>% as.data.frame() %>% 
+  mutate(team = "calvin")
+
+url2 <- 'https://athletics.hope.edu/sports/bsb/2020-21/teams/hope?view=lineup&r=0&pos='
+content2 <- read_html(url2)
+hopeDF <- html_table(content2, header = TRUE)[[4]] %>% as.data.frame() %>%
+  mutate(team = "hope")
+
+url3 <- 'https://www.miaa.org/sports/bsb/2020-21/teams/adrian?view=lineup&r=0&pos='
+content3 <- read_html(url3)
+adrianDF <- html_table(content3, header = TRUE)[[4]] %>% as.data.frame() %>%
+  mutate(team = "adrian")
+
+url4 <- 'http://almascots.com/sports/bsb/2020-21/teams/alma?view=lineup&r=0&pos='
+content4 <- read_html(url4)
+almaDF <- html_table(content4, header = TRUE)[[4]] %>% as.data.frame() %>%
+  mutate(team = "alma")
+
+url5 <- 'https://www.trinethunder.com/sports/bsb/2020-21/teams/trine?view=lineup&r=0&pos='
+content5 <- read_html(url5)
+trineDF <- html_table(content5, header = TRUE)[[5]] %>% as.data.frame() %>%
+  mutate(team = "trine")
+
+url6 <- 'https://www.miaa.org/sports/bsb/2020-21/teams/albion?view=lineup&r=0&pos='
+content6 <- read_html(url6)
+albionDF <- html_table(content6, header = TRUE)[[4]] %>% as.data.frame() %>%
+  mutate(team = "albion")
+
+url7 <- 'https://hornets.kzoo.edu/sports/bsb/2020-21/teams/kalamazoo?view=profile&r=0&pos='
+content7 <- read_html(url7)
+kalamazooDF <- html_table(content7, header = TRUE)[[16]] %>% as.data.frame() %>%
+  mutate(team = "kalamazoo")
+
+url8 <- 'https://www.olivetcomets.com/sports/bsb/2020-21/teams/olivet?view=lineup&r=0&pos='
+content8 <- read_html(url8)
+olivetDF <- html_table(content8, header = TRUE)[[4]] %>% as.data.frame() %>%
+  mutate(team = "olivet")
+```
+
+```{r}
+teams <- list(adrianDF=adrianDF, trineDF=trineDF,
+              calvinDF=calvinDF, almaDF=almaDF,
+              hopeDF=hopeDF, albionDF=albionDF,
+              olivetDF=olivetDF, kalamazooDF=kalamazooDF)
+```
+
+```{r message = FALSE, warning = FALSE}
+# data cleaning
+teams <- lapply(teams, cleanWithJanitor)
+teams <- lapply(teams, makeStatsIntegers, 5, 19)
+teams <- lapply(teams, removeNA)
+```
+
+
+```{r}
+# data cleaning
+all_teams <- do.call(bind_rows, teams) %>%
+  filter(ab < 200) %>% 
+  mutate(ops = obp + slg,
+         year_num = case_when(
+            yr == "Fr." ~ 1, yr == "Fr" ~ 1, yr == "Freshman" ~ 1,
+            yr == "So." ~ 2, yr == "So" ~ 2, yr == "Sophomore" ~ 2,
+            yr == "Jr." ~ 3, yr == "Jr" ~ 3, yr == "Junior" ~ 3,
+            yr == "Sr." ~ 4, yr == "Sr" ~ 4, yr == "Senior" ~ 4,
+            yr == "Sr.-5th" ~ 5, yr == "GS" ~ 5
+         ) %>% as.factor())
+```
+
+### Extended offensive stats
+
+```{r}
+url9 <- 'https://calvinknights.com/sports/bsb/2020-21/teams/calvin?view=lineup&r=0&pos='
+content9 <- read_html(url9)
+calvinDFb <- html_table(content9, header = TRUE)[[5]] %>% as.data.frame() %>% 
+  mutate(team = "calvin")
+
+url10 <- 'https://athletics.hope.edu/sports/bsb/2020-21/teams/hope?view=lineup&r=0&pos='
+content10 <- read_html(url10)
+hopeDFb <- html_table(content10, header = TRUE)[[5]] %>% as.data.frame() %>%
+  mutate(team = "hope")
+
+url11 <- 'https://www.miaa.org/sports/bsb/2020-21/teams/adrian?view=lineup&r=0&pos='
+content11 <- read_html(url11)
+adrianDFb <- html_table(content11, header = TRUE)[[5]] %>% as.data.frame() %>%
+  mutate(team = "adrian")
+
+url12 <- 'http://almascots.com/sports/bsb/2020-21/teams/alma?view=lineup&r=0&pos='
+content12 <- read_html(url12)
+almaDFb <- html_table(content12, header = TRUE)[[5]] %>% as.data.frame() %>%
+  mutate(team = "alma")
+
+url13 <- 'https://www.trinethunder.com/sports/bsb/2020-21/teams/trine?view=lineup&r=0&pos='
+content13 <- read_html(url13)
+trineDFb <- html_table(content13, header = TRUE)[[6]] %>% as.data.frame() %>%
+  mutate(team = "trine")
+
+url14 <- 'https://www.miaa.org/sports/bsb/2020-21/teams/albion?view=lineup&r=0&pos='
+content14 <- read_html(url14)
+albionDFb <- html_table(content14, header = TRUE)[[5]] %>% as.data.frame() %>%
+  mutate(team = "albion")
+
+url15 <- 'https://hornets.kzoo.edu/sports/bsb/2020-21/teams/kalamazoo?view=profile&r=0&pos='
+content15 <- read_html(url15)
+kalamazooDFb <- html_table(content15, header = TRUE)[[18]] %>% as.data.frame() %>%
+  mutate(team = "kalamazoo")
+
+url16 <- 'https://www.olivetcomets.com/sports/bsb/2020-21/teams/olivet?view=lineup&r=0&pos='
+content16 <- read_html(url16)
+olivetDFb <- html_table(content16, header = TRUE)[[5]] %>% as.data.frame() %>%
+  mutate(team = "olivet")
+```
+
+```{r}
+teams_exH <- list(adrianDFb=adrianDFb, trineDFb=trineDFb,
+              calvinDFb=calvinDFb, almaDFb=almaDFb,
+              hopeDFb=hopeDFb, albionDFb=albionDFb,
+              olivetDFb=olivetDFb, kalamazooDFb=kalamazooDFb)
+```
+
+```{r warning=FALSE, message=FALSE}
+#data cleaning
+teams_exH <- lapply(teams_exH, cleanWithJanitor)
+teams_exH <- lapply(teams_exH, makeStatsIntegers, 5, 15)
+teams_exH <- lapply(teams_exH, removeNA)
+```
+
+```{r}
+#data cleaning
+all_teams_exH <- do.call(bind_rows, teams_exH) %>%
+  filter(tb < 120) %>%
+  select(1:2, 6:15)
+
+all_teams_hitting <- all_teams %>%
+  left_join(all_teams_exH, by = "name", copy = TRUE)
+
+```
+
+### Park Factor data
+
+Park Factor is weird but it is a part of the Batting Runs parameter of OFF. Certain ballparks are more hitter friendly than others (maybe they have smaller fences, higher altitudes, etc). I gathered this data from each individual website on the "Split Stats" tab of their statistics pages. For example, Calvin's is here: https://calvinknights.com/sports/bsb/2020-21/teams/calvin?view=splits&pos=h . Park Factors over 1 indicate a more hitter-friendly park. 
+
+```{r park dataframe}
+school <- c("albion", "kalamazoo" ,"calvin", "adrian", "trine", "hope", "alma", "olivet")
+park <- c("Frank Joranko Field at Champions Stadium", "Woodworth Field" , 
+          "Baseball Field (Calvin)", "Nicolay Field", "Jannen Field", 
+          "Boeve Stadium", "Klenk Park", "Baseball Field (Olivet)")
+
+fields <- data.frame(school, park)
+```
+
+\newpage
+
+```{r}
+teams_ss <- read.csv("https://docs.google.com/spreadsheets/d/e/2PACX-1vSP2PP-tu0Tqv_eieBRlNRc7w4FVuusEd6Aw9EaGbQAr_E4n9lqjdPsiip-COwA8TpGwuZ4tnJ9c9b5/pub?output=csv")
+
+fields <- fields %>%
+  left_join(teams_ss, by = "school", copy = TRUE) 
+
+fields <- fields %>%
+  mutate(pf = ParkFactor(g_home, g_away, rf_home, rf_away, ra_home, ra_away),
+         team = school) %>%
+  select(team, pf) 
+
+fields %>% 
+  arrange((desc(pf))) %>%
+  pander::pander()
+```
+
+### Combine into master table
+
+Combining Park Factor data and hitting data
+
+```{r}
+all_teams_hitting <- all_teams_hitting %>%
+  left_join(fields, by = "team", copy = TRUE) 
+
+# all_teams_hitting_158 <- all_teams_hitting
+
+all_teams_hitting <- all_teams_hitting %>%
+  filter(ab>40)
+```
+
+### Calculating Batting Runs
+
+I calculate a lot of different stats in this section, and some are relevant to the Batting Runs formula while others are not. The important stats to note are wOBA, wRAA, wRC, and Batting Runs (see "Functions" section for explanations on these metrics). 
+
+```{r batting}
+all_teams_hitting <- all_teams_hitting %>%
+  mutate(x1b = h - x2b - x3b - hr,
+         wOBA = wOBA(bb, hbp, x1b, x2b, x3b, hr, ab, sf),
+         bbRate = bb / pa,
+         kRate = k / pa,
+         babip = BABIP(h, hr, ab, k, sf))
+
+lgR_sum <- sum(all_teams_hitting$r)
+lgPA_sum <- sum(all_teams_hitting$pa)
+lgPA_sumh <- lgPA_sum / 2
+lgwOBA_avg <- mean(all_teams_hitting$wOBA)
+
+all_teams_hitting <- all_teams_hitting %>%
+  mutate(lgwOBA = lgwOBA_avg,
+         lgR = lgR_sum,
+         lgPA = lgPA_sum,
+         lgPAh = lgPA_sumh, 
+         wRAA = wRAA(wOBA, lgwOBA, pa),
+         wRC = wRC(wOBA, lgwOBA, pa, lgR, lgPA),
+         lgwRC = sum(wRC) / 2,
+         batting_runs = BattingRuns(wRAA, lgR, lgPA, pf, pa, lgwRC, lgPAh))
+         
+```
+
+### Calculating base running runs and OFF
+
+Here I calculate the elements needed for an alternative version of the Base Running Runs metric. The typical formula is BsR = wSB + UBR + wGDP, but only data for wSB is available, so it is only that element that is added into the OFF formula (which is labeled "d3 off" in the code). 
+
+For OFF, I could have standardized variables so that batting and base running both are the same weight. For example, Gunner Rainey of Adrian College had a Batting Runs at about 21, but a Base Running Runs of about 1.4. Of course, this doesn't add to his OFF score that much, but I figured that it is okay to weight batting runs more importantly than base running runs since hitting is objectively more important anyway. In the future, I may try and standardize these variables and add them, just to see the results it produces. 
+
+```{r base running}
+all_teams_hitting <- all_teams_hitting %>%
+  mutate(outs = ab - h,
+         lgO = sum(outs),
+         rpo = RunsPerOut(lgR, lgO),
+         runCS = runCS(rpo),
+         lgSB = sum(sb),
+         lgCS = sum(cs),
+         lg1b = sum(x1b),
+         lgBB = sum(bb),
+         lgHBP = sum(hbp),
+         lgwSB = lgwSB(lgSB, lgCS, runCS, lg1b, lgBB, lgHBP),
+         wSB = wSB(sb, cs, runCS, lgwSB, x1b, bb, hbp),
+         d3_off = wSB + batting_runs
+         )
+```
+
+```{r}
+# view wSB in table format
+wsb_table <- all_teams_hitting %>%
+  select(name, sb, cs, wSB)
+```
+
+```{r}
+# own variation of OFF metric
+d3_off <- all_teams_hitting %>%
+  select(name, d3_off) %>%
+  arrange((desc(d3_off)))
+```
+
+I set up the first step to modeling in this next line of code, which I plan to return for predictive analysis. I filtered out seniors from this year because they wont be back next year (some will because of the NCAA eligibility rule that came after COVID, but right now I don't know for sure which seniors will stay)
+
+```{r}
+# for modeling next years stats
+non_seniors <- all_teams_hitting %>%
+  filter( name %in% c("Evan  Maday", "Ricky  Padilla", "Brant  Kym", "Thomas  Miller") | year_num %in% c(1, 2, 3))
+```
+
+## Visualizations
+
+```{r}
+all_teams_hitting %>%
+  select(name, team, avg, wOBA, sb, d3_off) %>%
+  arrange((desc(d3_off))) %>%
+  mutate(wOBA = round(wOBA, digits = 3),
+         d3_off = round(d3_off, digits = 1)) %>%
+  head(10) %>%
+  knitr::kable()
+```
+
+The above table shows the players in the league with the best OFF metrics, paired with their Batting Average (AVG), wOBA, stolen bases (sb), and OFF's. 
+
+Now, the lowest OFF's. 
+
+\newpage
+
+```{r}
+all_teams_hitting %>%
+  select(name, team, avg, wOBA, sb, d3_off) %>%
+  mutate(wOBA = round(wOBA, digits = 3),
+         d3_off = round(d3_off, digits = 1)) %>%
+  arrange(d3_off) %>%
+  head(10) %>%
+  knitr::kable()
+```
+
+First, I am a little surprised by seeing certain players on the list - specifically Kevin Tuttle and Jaret Koin of Alma and Ryan Petersen of Calvin. These are all players with good Batting Averages in the .300 range, but slightly underwhelming wOBA's in the low .300 range. Players with wOBA's close to their normal batting averages don't hit for power as much - they're singles hitters. And this is fine - singles are still really good, but OFF only cares about your wOBA. So even if you hit good for average, if you don't get extra base hits, OFF does not provide a positive number for a you. 
+
+The other strange happening I found was that Alma and Calvin's teams were very middle-of-the-road in OFF this past year collectively. They both had great offenses - Calvin's was best in the MIAA for most of the year, yet OFF didn't provide them with super high numbers across the board. Park Factor is certainly part of the reason why - both Calvin and Alma had PF's over 1, meaning they were slightly more hitter-friendly parks (or, they both were just better at home...I'm not convinced Park Factor is accurate in what it's trying to compute, especially in a limited number of games at the D3 level). This high PF is weighted against Calvin and Alma's offenses and adjusts their stats accordingly, which show to be worse than expected. 
+
+
+```{r}
+gf_boxplot(data = all_teams_hitting, ~ batting_runs)
+gf_boxplot(data = all_teams_hitting, ~ wSB)
+```
+
+The plots above show the format of both Batting Runs and Base Running Runs. The average is unsurprisingly near 0 in both, as 0 is always league average because these stats add or subtract from the league average. Both stats use a lot of league averages, whether it is league average runs, wSB, or at-bats. 
+
+```{r}
+gf_point(data = all_teams_hitting, d3_off ~ wOBA)
+```
+
+wOBA is very prominent in my version of OFF, so I wasn't that surprised to see a positive trend in this particular scatter plot above. Better wOBA's seem to indicate better OFF's. 
+
+```{r}
+gf_point(data = all_teams_hitting, d3_off ~ sb)
+```
+
+Stolen bases are not all that correlative to higher OFF's. There are more factors in the base running runs formula than stolen bases, and some people with less stolen bases still have higher OFF's because they hit better than they run. Hope's team generally has higher OFF's that expected because they steal a ton - way more than any other team in the MIAA, so it does help them quite a bit. This isn't visible in the plot, I just know from following their team. 
+
+
+```{r}
+gf_point(data = all_teams_hitting, d3_off ~ kRate)
+```
+
+Strikeout rate isn't in any of the formulas for any of the sabermetrics, but I thought it would be interesting to see if people who strikeout less have higher OFF's. There is sort of a trumpeting shape going on. Certain players with strikeout rates of 10% or less have varying OFF's - but it evens out closer to 0 with increased strikeout % rates. 
+
+```{r}
+gf_boxplot (data = all_teams_hitting, d3_off ~ fct_reorder(team, d3_off))
+```
+
+Lastly, I made a boxplot showing OFF's from each of the 8 teams in the MIAA, increasing from lowest to highest. Alma and Calvin are at the bottom, weighed down by their park factors and their apparent lack of power. The two worst teams in the MIAA follow, being Olivet and Trine. Kalamazoo is 4th best, followed by Albion, which had the lowest park factor, weighting their OFF's slightly higher. Lastly, two offensive powerhouses make it to the top - Hope gets there presumably with a combination of power and speed, and Adrian gets there because they are Adrian and they always win the MIAA. 
+
+OFF is interesting to look at in D3 baseball, and yet I'm not sure how I feel about it. Park Factor is one reason why I am mixed about these results. The metric is mainly used in the MLB where stadiums across the MLB differ in altitude and climate. The MIAA takes place only in Michigan and Indiana, and there may be differences in altitude across the state but probably not climate. So differences in PF shouldn't be that much different in the MIAA. There may still be fields that have shorter fences than others, and it would really be interesting to look at PF's from years past and compare. If Calvin has produced a PF of over 1 for many years in a row, then I have no problem accepting that maybe Calvin is just a hitters ballpark. But for now, I am disgruntled that Calvin's solid offense is somehow below average according to OFF. Again, it would be interesting to repeat this process on data from another year. 
+
+I like OFF's use of other good sabermetrics like wOBA and wSB, though. I think these stats are improvements over other stats commonly used in baseball, and it is certainly interesting to look at in the context of D3 collegiate baseball. There aren't a lot of sabermetrics available in D3 baseball because they don't matter as much for it. Only 3 D3 players got drafted this year - MLB teams don't care about D3 players as much as D2 and D1 players. Of course, I care, and its all because of my enjoyment in watching these teams face off every year. There is some pure talent in the MIAA and it is fun to watch the teams compete every year. While I didn't get to predictive modeling before the deadline, I still hope to complete that in the near future before the summer ends. 
+
+
+# Modeling
+
+Fun part
+
+```{r}
+# non_seniors <- non_seniors %>%
+#   select(team, wOBA, ops, pf, d3_off) %>%
+#   group_by(team) %>%
+#   summarize_all("mean") %>%
+#   mutate(wins = case_when(
+#     team == "adrian" ~ 37,
+#     team == "calvin" ~ 22,
+#     team == "hope" ~ 25,
+#     team == "albion" ~ 13,
+#     team == "trine" ~ 6,
+#     team == "kalamazoo" ~ 25,
+#     team == "olivet" ~ 6,
+#     team == "alma" ~ 14
+#   ),
+#   losses = case_when(
+#     team == "adrian" ~ 10,
+#     team == "calvin" ~ 16,
+#     team == "hope" ~ 15,
+#     team == "albion" ~ 27,
+#     team == "trine" ~ 28,
+#     team == "kalamazoo" ~ 15,
+#     team == "olivet" ~ 24,
+#     team == "alma" ~ 20
+#   ),
+#   win_pct = wins / (wins + losses))
+```
+
+```{r}
+# model1 <- glm(cbind(wins, losses) ~ d3_off, data = non_seniors, family = binomial(link = "logit"))
+# summary(model1)
+```
+
+
+
+
+
